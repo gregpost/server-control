@@ -1,0 +1,6 @@
+# Команды для выполнения сервером
+echo "Привет, мир!"
+ls -la
+get_screenshot
+python --version
+date
