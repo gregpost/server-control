@@ -1,32 +1,170 @@
-
----
+#!/usr/bin/env python3
 """
+Автономный Git-управляемый сервер автоматизации для Windows.
+Все результаты сохраняются в RESULTS.md для удаленного мониторинга.
+"""
+
+import os
+import sys
+import time
+import json
+import subprocess
+import threading
+import hashlib
+import locale
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Dict, List, Tuple
+
+import git
+from mss import mss
+from PIL import Image
+import pyautogui
+
+# Определяем системную кодировку
+SYSTEM_ENCODING = locale.getpreferredencoding()
+
+# Настройки путей - всё в текущей директории
+REPO_PATH = Path(".")
+COMMANDS_FILE = REPO_PATH / "commands.txt"
+INPUTS_FILE = REPO_PATH / "inputs.txt"
+RESULTS_FILE = REPO_PATH / "RESULTS.md"
+SCREENSHOTS_DIR = REPO_PATH / "screenshots"
+LOGS_DIR = REPO_PATH / "logs"
+
+# Блокировки
+command_lock = threading.Lock()
+EXECUTED_COMMANDS_FILE = REPO_PATH / ".executed_commands"
+MAX_SCREENSHOT_COMMITS = 5
+
+# Настройка pyautogui
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0.1
+
+
+class AutomationServer:
+    """Автономный сервер автоматизации."""
+    
+    def __init__(self, repo_url: Optional[str] = None):
+        self.repo_url = repo_url
+        self.repo = None
+        self.start_time = datetime.now()
+        self.commands_executed = 0
+        self.screenshots_taken = 0
+        self.inputs_processed = 0
+        self.errors_count = 0
+        self.last_activity = "Запуск сервера"
+        self.current_status = "RUNNING"
+        self.last_status_print = time.time()
+        self.setup_environment()
+        self.init_results_file()
+        
+    def init_results_file(self):
+        """Инициализация файла результатов."""
+        if not RESULTS_FILE.exists():
+            RESULTS_FILE.write_text(
+                "# Результаты выполнения команд\n\n"
+                f"**Сервер запущен:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                "---\n\n",
+                encoding='utf-8'
+            )
+    
+    def safe_read_file(self, file_path: Path) -> str:
+        """Безопасное чтение файла с автоопределением кодировки."""
+        if not file_path.exists():
+            return ""
+        
+        encodings = ['utf-8', 'utf-8-sig', SYSTEM_ENCODING, 'cp1251', 'cp866', 'latin-1']
+        
+        for encoding in encodings:
+            try:
+                content = file_path.read_text(encoding=encoding)
+                if encoding != 'utf-8':
+                    file_path.write_text(content, encoding='utf-8')
+                return content
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        
+        raw_data = file_path.read_bytes()
+        return raw_data.decode('utf-8', errors='replace')
+    
+    def setup_environment(self):
+        """Настройка окружения в текущей директории."""
+        SCREENSHOTS_DIR.mkdir(exist_ok=True)
+        LOGS_DIR.mkdir(exist_ok=True)
+        
+        if not COMMANDS_FILE.exists():
+            COMMANDS_FILE.write_text(
+                "# Команды для выполнения\n# get_screenshot - создать скриншот\n\n",
+                encoding='utf-8'
+            )
+        
+        if not INPUTS_FILE.exists():
+            INPUTS_FILE.write_text(
+                "# Команды ввода\n# Формат:\n# type: click\n# coordinates: [0.5, 0.5]\n# button: left\n\n",
+                encoding='utf-8'
+            )
+        
+        if not EXECUTED_COMMANDS_FILE.exists():
+            EXECUTED_COMMANDS_FILE.write_text("", encoding='utf-8')
         
         try:
-            # Читаем существующий файл
+            self.repo = git.Repo(REPO_PATH)
+        except git.InvalidGitRepositoryError:
+            self.repo = git.Repo.init(REPO_PATH)
+            with self.repo.config_writer() as config:
+                config.set_value("user", "name", "Automation Server")
+                config.set_value("user", "email", "server@automation.local")
+            
+            gitignore_path = REPO_PATH / ".gitignore"
+            if not gitignore_path.exists():
+                gitignore_path.write_text(
+                    "*.pyc\n__pycache__/\n.DS_Store\n*.tmp\nlogs/status.log\n.executed_commands\n",
+                    encoding='utf-8'
+                )
+            
+            self.repo.index.add(['.gitignore', 'commands.txt', 'inputs.txt', 'RESULTS.md'])
+            self.repo.index.commit("Initial commit")
+    
+    def add_to_results(self, entry_type: str, command: str, result: str, success: bool):
+        """Добавление записи в RESULTS.md."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        status_icon = "OK" if success else "ERROR"
+        status_text = "Успешно" if success else "Ошибка"
+        
+        if entry_type == "command":
+            header = f"### {status_icon} Команда - {timestamp}"
+        elif entry_type == "screenshot":
+            header = f"### SCREENSHOT - {timestamp}"
+        elif entry_type == "input":
+            header = f"### INPUT - {timestamp}"
+        else:
+            header = f"### {timestamp}"
+        
+        if len(result) > 1000:
+            result = result[:997] + "..."
+        
+        entry = f"\n{header}\n\n"
+        entry += f"**Команда:** `{command}`\n"
+        entry += f"**Статус:** {status_text}\n\n"
+        entry += f"```\n{result}\n```\n\n---\n"
+        
+        try:
             if RESULTS_FILE.exists():
                 old_content = RESULTS_FILE.read_text(encoding='utf-8')
-                
-                # Находим позицию после заголовка
                 header_end = old_content.find("---\n\n")
                 if header_end != -1:
                     header_end += 5
-                    # Вставляем новую запись после заголовка
                     new_content = old_content[:header_end] + entry + old_content[header_end:]
                 else:
                     new_content = entry + old_content
             else:
-                new_content = f"""# 📊 Результаты выполнения команд
-
-**Сервер запущен:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
----
-{entry}"""
+                new_content = f"# Результаты выполнения команд\n\n**Сервер запущен:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n{entry}"
             
             RESULTS_FILE.write_text(new_content, encoding='utf-8')
             
         except Exception as e:
-            print(f"⚠ Ошибка записи в RESULTS.md: {e}")
+            print(f"Warning: Cannot write to RESULTS.md: {e}")
     
     def print_status(self):
         """Вывод статуса в консоль."""
@@ -53,8 +191,8 @@
 ║ {self.last_activity[:60]:<60}║
 ╚══════════════════════════════════════════════════════════════╝
 
-📋 commands.txt | 🖱 inputs.txt | 📊 RESULTS.md | 📸 screenshots/
-⏎  Введите команду или 'help':""", end=' ', flush=True)
+commands.txt | inputs.txt | RESULTS.md | screenshots/
+Enter command or 'help':""", end=' ', flush=True)
     
     def pull_changes(self):
         """Получение изменений из Git."""
@@ -62,25 +200,20 @@
             try:
                 origin = self.repo.remotes.origin
                 origin.pull()
-            except Exception as e:
+            except Exception:
                 pass
     
     def push_changes(self, message: str = "Automated commit"):
         """Отправка изменений в Git."""
         try:
-            # Добавляем важные файлы
-            self.repo.index.add([
-                'RESULTS.md',
-                'commands.txt', 
-                'inputs.txt',
-                'screenshots/*.png'
-            ])
+            self.repo.index.add(['RESULTS.md', 'commands.txt', 'inputs.txt'])
+            self.repo.index.add(['screenshots/*.png'])
             
             if self.repo.is_dirty() or self.repo.untracked_files:
                 self.repo.index.commit(message)
                 if self.repo_url:
                     self.repo.remotes.origin.push()
-        except Exception as e:
+        except Exception:
             pass
     
     def read_commands(self) -> List[str]:
@@ -111,7 +244,7 @@
             filename = f"screenshot_{timestamp}.png"
             screenshot_path = SCREENSHOTS_DIR / filename
             
-            print(f"\n📸 Создание скриншота...")
+            print(f"\nCreating screenshot...")
             
             with mss() as sct:
                 sct.shot(output=str(screenshot_path))
@@ -122,25 +255,23 @@
             size_mb = screenshot_path.stat().st_size / (1024 * 1024)
             self.screenshots_taken += 1
             
-            # Очистка старых скриншотов
             self.cleanup_old_screenshots()
             
-            success_msg = f"Скриншот создан: {filename} ({size_mb:.2f} MB)"
-            print(f"✅ {success_msg}")
+            success_msg = f"Screenshot created: {filename} ({size_mb:.2f} MB)"
+            print(f"OK {success_msg}")
             
-            self.last_activity = f"Скриншот: {filename}"
+            self.last_activity = f"Screenshot: {filename}"
             
-            # Добавляем в RESULTS.md
             self.add_to_results("screenshot", "get_screenshot", 
-                              f"Скриншот сохранен: {filename}\nРазмер: {size_mb:.2f} MB\nПуть: screenshots/{filename}", 
+                              f"Screenshot: {filename}\nSize: {size_mb:.2f} MB\nPath: screenshots/{filename}", 
                               True)
             
             return True, success_msg
             
         except Exception as e:
             self.errors_count += 1
-            error_msg = f"Ошибка скриншота: {str(e)}"
-            print(f"❌ {error_msg}")
+            error_msg = f"Screenshot error: {str(e)}"
+            print(f"ERROR {error_msg}")
             
             self.add_to_results("screenshot", "get_screenshot", error_msg, False)
             
@@ -167,7 +298,7 @@
             if command.strip().lower() == "get_screenshot":
                 return self.take_screenshot()
             
-            print(f"\n▶ Выполнение: {command}")
+            print(f"\nExecuting: {command}")
             
             result = subprocess.run(
                 command,
@@ -181,38 +312,36 @@
             
             output = result.stdout + result.stderr
             
-            # Выводим результат в консоль
             if result.stdout:
                 print(result.stdout)
             if result.stderr:
-                print(f"⚠ {result.stderr}")
+                print(result.stderr)
             
             success = result.returncode == 0
             
             self.commands_executed += 1
-            self.last_activity = f"Команда: {command[:50]}"
+            self.last_activity = f"Command: {command[:50]}"
             
             if success:
-                print(f"✅ Выполнено успешно")
+                print("OK")
             else:
                 self.errors_count += 1
-                print(f"❌ Ошибка (код {result.returncode})")
+                print(f"ERROR (code {result.returncode})")
             
-            # Добавляем в RESULTS.md
-            self.add_to_results("command", command, output, success)
+            self.add_to_results("command", command, output if output else "(no output)", success)
             
             return success, output
             
         except subprocess.TimeoutExpired:
             self.errors_count += 1
-            error_msg = "⏱ Превышен лимит времени (300с)"
-            print(f"❌ {error_msg}")
+            error_msg = "Timeout (300s)"
+            print(f"ERROR {error_msg}")
             self.add_to_results("command", command, error_msg, False)
             return False, error_msg
         except Exception as e:
             self.errors_count += 1
-            error_msg = f"Ошибка: {str(e)}"
-            print(f"❌ {error_msg}")
+            error_msg = f"Error: {str(e)}"
+            print(f"ERROR {error_msg}")
             self.add_to_results("command", command, error_msg, False)
             return False, error_msg
     
@@ -273,9 +402,9 @@
             
             elif input_type == 'delay':
                 duration = input_data.get('duration', 0.5)
-                print(f"⏱ Задержка {duration}с...")
+                print(f"Delay {duration}s...")
                 time.sleep(duration)
-                msg = f"Задержка {duration}с"
+                msg = f"Delay {duration}s"
                 self.add_to_results("input", "delay", msg, True)
                 return True, msg
             
@@ -285,29 +414,29 @@
                 y = int(input_data['y'] * screen_height)
                 button = input_data.get('button', 'left')
                 
-                print(f"🖱 Клик ({x}, {y}) - {button}")
+                print(f"Click ({x}, {y}) - {button}")
                 pyautogui.click(x, y, button=button)
-                msg = f"Клик ({x}, {y}) - {button}"
+                msg = f"Click ({x}, {y}) - {button}"
                 self.add_to_results("input", f"click [{input_data['x']}, {input_data['y']}]", msg, True)
                 return True, msg
             
             elif input_type == 'keyboard':
                 keys = input_data.get('keys', '')
-                print(f"⌨ Ввод: {keys}")
+                print(f"Keys: {keys}")
                 
                 if '+' in keys:
                     pyautogui.hotkey(*keys.split('+'))
                 else:
                     pyautogui.typewrite(keys)
                 
-                msg = f"Клавиши: {keys}"
+                msg = f"Keys: {keys}"
                 self.add_to_results("input", "keyboard", msg, True)
                 return True, msg
             
-            return False, f"Неизвестный тип: {input_type}"
+            return False, f"Unknown type: {input_type}"
             
         except Exception as e:
-            error_msg = f"Ошибка ввода: {str(e)}"
+            error_msg = f"Input error: {str(e)}"
             self.add_to_results("input", str(input_data), error_msg, False)
             return False, error_msg
     
@@ -318,59 +447,57 @@
             if not inputs:
                 return
             
-            print(f"\n⌨ Выполнение {len(inputs)} команд ввода:")
+            print(f"\nProcessing {len(inputs)} input commands:")
             
             results_summary = []
             for i, input_data in enumerate(inputs, 1):
                 success, message = self.execute_input(input_data)
-                status = "✅" if success else "❌"
+                status = "OK" if success else "ERROR"
                 print(f"  {i}. {status} {message}")
                 results_summary.append(f"{i}. {status} {message}")
                 if not success:
                     self.errors_count += 1
             
             self.inputs_processed += len(inputs)
-            self.last_activity = f"Обработано {len(inputs)} вводов"
+            self.last_activity = f"Processed {len(inputs)} inputs"
             
-            # Добавляем сводку ввода в RESULTS.md
             summary = "\n".join(results_summary)
-            self.add_to_results("input", f"Пакет из {len(inputs)} команд", summary, True)
+            self.add_to_results("input", f"Batch of {len(inputs)} commands", summary, True)
             
-            # Очищаем файл после выполнения
             INPUTS_FILE.write_text(
-                "# Команды ввода\n# Формат:\n# type: click\n# coordinates: [0.5, 0.5]\n# button: left\n\n",
+                "# Commands input\n# Format:\n# type: click\n# coordinates: [0.5, 0.5]\n# button: left\n\n",
                 encoding='utf-8'
             )
             
         except Exception as e:
             self.errors_count += 1
-            print(f"❌ Ошибка обработки ввода: {e}")
+            print(f"ERROR processing inputs: {e}")
     
     def show_help(self):
         """Показ справки."""
         print("""
 ╔══════════════════════════════════════════════════════════════╗
-║                    ДОСТУПНЫЕ КОМАНДЫ                         ║
+║                    AVAILABLE COMMANDS                        ║
 ╠══════════════════════════════════════════════════════════════╣
-║ screen, scr     - Создать скриншот                          ║
-║ status, st      - Показать статус                           ║
-║ exec, run [cmd] - Выполнить команду в консоли               ║
-║   Пример: exec dir                                         ║
-║   Пример: exec echo Привет                                 ║
-║ click [x] [y]   - Клик мышью (координаты 0.0-1.0)          ║
-║   Пример: click 0.5 0.5  (центр экрана)                    ║
-║   Пример: click 0.1 0.1  (левый верхний угол)              ║
-║ type [текст]    - Напечатать текст                          ║
-║   Пример: type Привет, мир!                                ║
-║ hotkey [клавиши] - Нажать комбинацию клавиш                ║
-║   Пример: hotkey ctrl+c                                    ║
-║   Пример: hotkey alt+tab                                   ║
-║ results         - Показать RESULTS.md                       ║
-║ help, ?         - Показать эту справку                      ║
-║ quit, exit      - Выход                                    ║
+║ screen, scr     - Take screenshot                           ║
+║ status, st      - Show status                               ║
+║ exec, run [cmd] - Execute console command                   ║
+║   Example: exec dir                                        ║
+║   Example: exec echo Hello                                 ║
+║ click [x] [y]   - Mouse click (0.0-1.0 coordinates)        ║
+║   Example: click 0.5 0.5  (center)                         ║
+║   Example: click 0.1 0.1  (top-left)                       ║
+║ type [text]     - Type text                                ║
+║   Example: type Hello world!                               ║
+║ hotkey [keys]   - Press key combination                    ║
+║   Example: hotkey ctrl+c                                   ║
+║   Example: hotkey alt+tab                                  ║
+║ results         - Show RESULTS.md content                  ║
+║ help, ?         - Show this help                           ║
+║ quit, exit      - Exit                                     ║
 ║                                                             ║
-║ Сервер проверяет commands.txt и inputs.txt                 ║
-║ Все результаты сохраняются в RESULTS.md                    ║
+║ Server checks commands.txt and inputs.txt                  ║
+║ All results saved to RESULTS.md                            ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
     
@@ -389,7 +516,7 @@
                 self.execute_command(args)
                 self.commands_executed += 1
             else:
-                print("❌ Укажите команду. Пример: exec dir")
+                print("ERROR: Specify command. Example: exec dir")
         elif cmd == 'click':
             try:
                 coords = args.split()
@@ -398,70 +525,67 @@
                     screen_w, screen_h = pyautogui.size()
                     click_x = int(x * screen_w)
                     click_y = int(y * screen_h)
-                    print(f"🖱 Клик ({click_x}, {click_y})")
+                    print(f"Click ({click_x}, {click_y})")
                     pyautogui.click(click_x, click_y)
                     self.inputs_processed += 1
-                    self.last_activity = f"Клик ({click_x}, {click_y})"
+                    self.last_activity = f"Click ({click_x}, {click_y})"
                     self.add_to_results("input", f"click {x} {y}", 
-                                      f"Клик ({click_x}, {click_y})", True)
+                                      f"Click ({click_x}, {click_y})", True)
                 else:
-                    print("❌ Формат: click X Y (например: click 0.5 0.5)")
+                    print("ERROR: Format: click X Y (e.g.: click 0.5 0.5)")
             except ValueError:
-                print("❌ Координаты должны быть числами")
+                print("ERROR: Coordinates must be numbers")
         elif cmd == 'type':
             if args:
-                print(f"⌨ Печать: {args}")
+                print(f"Typing: {args}")
                 pyautogui.typewrite(args)
                 self.inputs_processed += 1
-                self.last_activity = f"Ввод текста"
-                self.add_to_results("input", "type", f"Текст: {args}", True)
+                self.last_activity = "Text input"
+                self.add_to_results("input", "type", f"Text: {args}", True)
             else:
-                print("❌ Укажите текст. Пример: type Привет")
+                print("ERROR: Specify text. Example: type Hello")
         elif cmd == 'hotkey':
             if args:
                 keys = args.replace(' ', '').split('+')
-                print(f"⌨ Комбинация: {'+'.join(keys)}")
+                print(f"Hotkey: {'+'.join(keys)}")
                 pyautogui.hotkey(*keys)
                 self.inputs_processed += 1
                 self.last_activity = f"Hotkey: {'+'.join(keys)}"
-                self.add_to_results("input", "hotkey", f"Комбинация: {'+'.join(keys)}", True)
+                self.add_to_results("input", "hotkey", f"Combination: {'+'.join(keys)}", True)
             else:
-                print("❌ Укажите клавиши. Пример: hotkey ctrl+c")
+                print("ERROR: Specify keys. Example: hotkey ctrl+c")
         elif cmd == 'results':
             if RESULTS_FILE.exists():
                 print("\n" + "="*60)
-                print("Содержимое RESULTS.md:")
+                print("RESULTS.md content:")
                 print("="*60)
                 print(RESULTS_FILE.read_text(encoding='utf-8'))
             else:
-                print("❌ Файл RESULTS.md еще не создан")
+                print("RESULTS.md not created yet")
         elif cmd in ['help', '?']:
             self.show_help()
         elif cmd in ['quit', 'exit']:
             self.current_status = "STOPPING"
-            print("\n⚠ Завершение работы...")
-            self.add_to_results("system", "shutdown", "Сервер остановлен пользователем", True)
+            print("\nShutting down...")
+            self.add_to_results("system", "shutdown", "Server stopped by user", True)
             self.push_changes("Server stopped")
             sys.exit(0)
         elif cmd:
-            # Выполняем как консольную команду
             self.execute_command(user_input)
             self.commands_executed += 1
         
         if cmd not in ['status', 'st', 'quit', 'exit']:
-            input("\nНажмите Enter для продолжения...")
+            input("\nPress Enter to continue...")
     
     def run(self, check_interval: int = 5):
         """Главный цикл сервера."""
         self.print_status()
         
-        # Поток для проверки файлов
         def file_checker():
             while self.current_status == "RUNNING":
                 with command_lock:
                     self.pull_changes()
                     
-                    # Проверка commands.txt
                     commands = self.read_commands()
                     executed = self.get_executed_commands()
                     
@@ -472,14 +596,13 @@
                             new_commands.append(cmd)
                     
                     if new_commands:
-                        print(f"\n📋 Найдено {len(new_commands)} новых команд в файле")
+                        print(f"\nFound {len(new_commands)} new commands in file")
                         for cmd in new_commands:
                             self.execute_command(cmd)
                             self.mark_command_executed(cmd)
                         self.push_changes(f"Executed {len(new_commands)} commands")
-                        print("\nНажмите Enter для продолжения...")
+                        print("\nPress Enter to continue...")
                     
-                    # Проверка inputs.txt
                     if INPUTS_FILE.exists():
                         content = self.safe_read_file(INPUTS_FILE)
                         has_commands = any(
@@ -487,17 +610,16 @@
                             for line in content.splitlines()
                         )
                         if has_commands:
-                            print("\n📋 Обнаружены команды ввода в файле")
+                            print("\nFound input commands in file")
                             self.process_inputs()
                             self.push_changes("Processed inputs")
-                            print("\nНажмите Enter для продолжения...")
+                            print("\nPress Enter to continue...")
                 
                 time.sleep(check_interval)
         
         checker_thread = threading.Thread(target=file_checker, daemon=True)
         checker_thread.start()
         
-        # Главный цикл
         while self.current_status == "RUNNING":
             if time.time() - self.last_status_print > 2:
                 self.print_status()
@@ -526,9 +648,9 @@
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Автономный сервер автоматизации')
-    parser.add_argument('--repo-url', type=str, help='URL удаленного Git репозитория')
-    parser.add_argument('--interval', type=int, default=5, help='Интервал проверки файлов (сек)')
+    parser = argparse.ArgumentParser(description='Automation Server')
+    parser.add_argument('--repo-url', type=str, help='Remote Git repository URL')
+    parser.add_argument('--interval', type=int, default=5, help='File check interval (sec)')
     
     args = parser.parse_args()
     
