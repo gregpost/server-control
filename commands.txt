@@ -1,6 +1,22 @@
-# Команды для выполнения сервером
-echo "Привет, мир!"
-ls -la
+# Тест 1: Информация о системе
+echo ===== Test 1: System Info =====
+ver
+date /t
+time /t
+
+# Тест 2: Создание файла
+echo ===== Test 2: Create file =====
+echo Server test file > test_output.txt
+echo Second line >> test_output.txt
+type test_output.txt
+
+# Тест 3: Скриншот
+echo ===== Test 3: Screenshot =====
 get_screenshot
-python --version
-date
+
+# Тест 4: Список файлов
+echo ===== Test 4: File list =====
+dir /B
+
+# Тест 5: Еще скриншот
+get_screenshot
